@@ -1,0 +1,118 @@
+# Deployment runbook — Vercel + Render + Neon
+
+Production topology:
+
+| Tier      | Service                     | What it hosts                          |
+| --------- | --------------------------- | -------------------------------------- |
+| Frontend  | **Vercel**                  | React SPA (`UI/`)                      |
+| Backend   | **Render** (free web)       | NestJS API (`backend/`)               |
+| Database  | **Neon**                    | PostgreSQL (+ `pg_trgm` for search)   |
+| Blobs     | **Cloudflare R2** (or S3)   | uploaded files (S3-compatible driver) |
+
+There is a deliberate ordering: the backend needs the DB + storage first; the
+frontend needs the backend URL; the backend's `CORS_ORIGIN` then needs the
+frontend URL. So: **DB → storage → backend → frontend → wire CORS back**.
+
+Config already in the repo: `render.yaml` (backend blueprint) and
+`UI/vercel.json` (SPA rewrites). You supply the secrets in each dashboard.
+
+---
+
+## 1. Database — Neon
+
+1. Create a project at <https://neon.tech> (free tier).
+2. Copy the **direct** (non-pooled) connection string — it looks like
+   `postgresql://USER:PASSWORD@ep-xxx.REGION.aws.neon.tech/DBNAME?sslmode=require`.
+   Render runs a persistent server, so the direct URL is correct (no pooler needed).
+3. Keep it for step 3 (`DATABASE_URL`). Migrations create the schema **and** run
+   `CREATE EXTENSION pg_trgm` — Neon allows this, no manual step needed.
+
+## 2. Blob storage — Cloudflare R2 (recommended)
+
+1. Cloudflare dashboard → **R2** → create a bucket, e.g. `dataroom-blobs`.
+2. **R2 → Manage API Tokens** → create a token with **Object Read & Write** for
+   that bucket. Note the **Access Key ID**, **Secret Access Key**, and the
+   **S3 API endpoint** (`https://<accountid>.r2.cloudflarestorage.com`).
+3. You'll enter these on Render as `S3_*` (step 3). For R2 use
+   `S3_REGION=auto` and `S3_FORCE_PATH_STYLE=true` (already defaulted in `render.yaml`).
+
+> Supabase Storage or AWS S3 work too — same env vars. For **AWS S3** set
+> `S3_REGION` to the bucket region, `S3_FORCE_PATH_STYLE=false`, and leave
+> `S3_ENDPOINT` blank. For **Supabase** use its S3 endpoint + `S3_FORCE_PATH_STYLE=true`.
+
+## 3. Backend — Render
+
+1. <https://render.com> → **New → Blueprint** → connect the GitHub repo
+   `NeroN-95/dataroom-mvp`. Render reads `render.yaml` and creates **dataroom-api**.
+2. When prompted, fill the `sync: false` env vars:
+   - `DATABASE_URL` → the Neon string from step 1
+   - `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` → from step 2
+   - `GOOGLE_CLIENT_ID` → your public OAuth Web client id (or leave blank)
+   - `CORS_ORIGIN` / `APP_URL` → **placeholder for now** (e.g. `https://example.com`);
+     you'll set the real Vercel URL in step 5. `JWT_SECRET` is auto-generated.
+3. Deploy. Build runs `npm ci && nest build`; start runs `prisma migrate deploy`
+   then `node dist/main.js`. When live, note the URL, e.g.
+   `https://dataroom-api.onrender.com`. Health check: open
+   `https://dataroom-api.onrender.com/api/health` → `{"status":"ok"}`.
+
+> Free tier sleeps after ~15 min idle; the first request after a sleep takes
+> ~30–50 s to wake. Fine for a demo.
+
+## 4. Frontend — Vercel
+
+1. <https://vercel.com> → **Add New → Project** → import the same repo.
+2. **Root Directory: `UI`** (important — the frontend lives in `UI/`, not the repo root).
+   Framework preset **Vite** is auto-detected (build `vite build`, output `dist`).
+3. Add environment variables (Production):
+   - `VITE_API_URL` = `https://dataroom-api.onrender.com/api`  ← Render URL + `/api`
+   - `VITE_GOOGLE_CLIENT_ID` = your public OAuth Web client id (or leave blank)
+4. Deploy. Note the URL, e.g. `https://dataroom-mvp.vercel.app`.
+   `UI/vercel.json` rewrites all paths to `index.html` so deep links
+   (`/rooms/:id`, `/shared/:token`) work.
+
+## 5. Wire the frontend URL back into the backend
+
+1. On **Render → dataroom-api → Environment**, set:
+   - `CORS_ORIGIN` = `https://dataroom-mvp.vercel.app`
+   - `APP_URL` = `https://dataroom-mvp.vercel.app`  (used to build share links)
+   Save → Render redeploys automatically.
+
+## 6. Google sign-in (if used)
+
+In **Google Cloud Console → APIs & Services → Credentials → your Web OAuth client**,
+add to **Authorized JavaScript origins**:
+- `https://dataroom-mvp.vercel.app` (the Vercel URL)
+
+(The existing `http://localhost:5173` can stay for local dev.)
+
+## 7. Smoke test
+
+1. Open the Vercel URL, register or sign in.
+2. Create a room, upload a file, view it, create a public share, open the share
+   link in a private window (anonymous) — it should render.
+3. If uploads fail with a network error, re-check `VITE_API_URL` (must end in
+   `/api`) and `CORS_ORIGIN` (must equal the Vercel origin, no trailing slash).
+
+---
+
+### Quick reference — backend env vars
+
+| Var | Value |
+| --- | --- |
+| `DATABASE_URL` | Neon direct string, `?sslmode=require` |
+| `JWT_SECRET` | auto-generated by Render |
+| `CORS_ORIGIN` / `APP_URL` | the Vercel origin |
+| `GOOGLE_CLIENT_ID` | public OAuth Web client id (optional) |
+| `STORAGE_DRIVER` | `s3` |
+| `S3_ENDPOINT` | R2/Supabase endpoint (blank for AWS) |
+| `S3_REGION` | `auto` (R2) / bucket region (AWS) |
+| `S3_BUCKET` | bucket name |
+| `S3_FORCE_PATH_STYLE` | `true` (R2/Supabase) / `false` (AWS) |
+| `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | storage credentials |
+
+### Quick reference — frontend env vars
+
+| Var | Value |
+| --- | --- |
+| `VITE_API_URL` | `https://<render-app>.onrender.com/api` |
+| `VITE_GOOGLE_CLIENT_ID` | public OAuth Web client id (optional) |

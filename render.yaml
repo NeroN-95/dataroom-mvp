@@ -1,0 +1,54 @@
+# Render blueprint for the Data Room backend (NestJS + Prisma + PostgreSQL).
+#
+# Deploy: Render Dashboard -> New -> Blueprint -> select this repo. Render reads
+# this file, creates the service, then prompts only for DATABASE_URL (the sole
+# secret). The frontend deploys separately on Vercel (see DEPLOY.md).
+services:
+  - type: web
+    name: dataroom-api
+    runtime: node
+    plan: free
+    rootDir: backend
+    # devDependencies (@nestjs/cli, prisma) are needed to build and to run
+    # `prisma migrate deploy`, so install them explicitly.
+    buildCommand: npm ci --include=dev && npm run build
+    # migrate deploy is idempotent (a no-op when there are no pending migrations),
+    # so running it on every boot is safe on the free tier (no preDeploy step).
+    startCommand: npx prisma migrate deploy && node dist/main.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      # Neon DIRECT (non-pooled) connection string, must include ?sslmode=require.
+      # This is the only value you paste in the Render dashboard.
+      - key: DATABASE_URL
+        sync: false
+      # Render generates a strong value; the app fails fast if this is ever unset.
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRES_IN
+        value: "7d"
+      # Public OAuth Web client id (public by design — already in the frontend JS).
+      - key: GOOGLE_CLIENT_ID
+        value: "380824773550-rst31l7e30idj1fo5rksfk27u3vgic8h.apps.googleusercontent.com"
+      # Blob storage. "local" = Render's ephemeral disk (files reset on redeploy)
+      # — fine to start. To switch to persistent object storage later, set
+      # STORAGE_DRIVER=s3 and add the S3_* vars below in the dashboard.
+      - key: STORAGE_DRIVER
+        value: local
+      # CORS_ORIGIN and APP_URL are set in the dashboard after the Vercel URL
+      # exists (they are plain URLs, not secrets).
+      #
+      # --- Object storage (only when STORAGE_DRIVER=s3) ---
+      # - key: S3_ENDPOINT          # R2/Supabase endpoint; blank for AWS
+      #   sync: false
+      # - key: S3_REGION            # "auto" for R2; bucket region for AWS
+      #   value: auto
+      # - key: S3_BUCKET
+      #   sync: false
+      # - key: S3_FORCE_PATH_STYLE  # "true" for R2/Supabase; "false" for AWS
+      #   value: "true"
+      # - key: S3_ACCESS_KEY_ID
+      #   sync: false
+      # - key: S3_SECRET_ACCESS_KEY
+      #   sync: false

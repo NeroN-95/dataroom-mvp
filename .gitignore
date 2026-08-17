@@ -1,0 +1,26 @@
+# deps
+node_modules/
+**/node_modules/
+
+# build
+dist/
+**/dist/
+frontend/dist/
+
+# env
+.env
+**/.env
+**/.env.production
+**/.env.local
+!**/.env.example
+
+# storage (local uploaded blobs)
+backend/storage/
+backend/uploads/
+
+# logs
+*.log
+npm-debug.log*
+
+# editor
+.DS_Store

@@ -1,0 +1,147 @@
+// Data Room — data model.
+//
+// One Node table holds both folders and files (discriminated by `type`) so
+// listing, breadcrumbs, move, subtree delete, search and — most importantly —
+// permission inheritance are written once and behave identically for both.
+//
+// The tree uses a materialised `path`: each node stores its ancestor chain as a
+// string. Reads (subtree size, breadcrumbs, "which shares cover this node") get
+// cheap at the cost of costlier moves — the right trade for a read-heavy vault.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pg_trgm]
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  name         String
+  passwordHash String? // null for Google-only accounts
+  googleId     String?  @unique
+  createdAt    DateTime @default(now())
+
+  dataRooms   DataRoom[]
+  shares      Share[]      @relation("SharesCreated")
+  shareGrants ShareGrant[]
+}
+
+/// A Data Room is a drive owned by one user. Its whole tree hangs off a single
+/// root Node, so "share the room" is just "share the root" — one code path.
+model DataRoom {
+  id        String   @id @default(uuid())
+  name      String
+  ownerId   String
+  rootId    String?  @unique // the FOLDER node at the top of the tree
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  owner User   @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  root  Node?  @relation("RoomRoot", fields: [rootId], references: [id])
+  nodes Node[] @relation("RoomNodes")
+
+  @@index([ownerId])
+}
+
+enum NodeType {
+  FOLDER
+  FILE
+}
+
+/// A folder or a file. `path` is the materialised ancestor chain INCLUDING self,
+/// e.g. "/<rootId>/<legalId>/<selfId>/". It always starts and ends with "/" so a
+/// prefix test can't leak across siblings ("/a/b/" never prefix-matches "/a/bc/").
+/// Subtree(node) = nodes where `path LIKE node.path || '%'`; ancestors are just
+/// the ids parsed out of `path`, which is what makes authorisation an indexed
+/// `nodeId IN (...)` rather than a scan.
+model Node {
+  id         String   @id @default(uuid())
+  type       NodeType
+  name       String
+  dataRoomId String
+  parentId   String?
+  path       String
+
+  // FILE payload — null for folders.
+  storageKey String?
+  mimeType   String?
+  size       Int?
+
+  // Soft delete: a node and its whole subtree share one deleteBatchId so a delete
+  // can be previewed, undone, and scoped as a single action.
+  deletedAt     DateTime?
+  deleteBatchId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  dataRoom   DataRoom  @relation("RoomNodes", fields: [dataRoomId], references: [id], onDelete: Cascade)
+  parent     Node?     @relation("NodeChildren", fields: [parentId], references: [id], onDelete: Cascade)
+  children   Node[]    @relation("NodeChildren")
+  rootOfRoom DataRoom? @relation("RoomRoot")
+  shares     Share[]
+
+  @@index([dataRoomId, parentId])
+  @@index([dataRoomId, name])
+  @@index([path])
+  @@index([deleteBatchId])
+  // Name uniqueness within a parent is a partial, case-insensitive unique index
+  // (parentId, lower(name)) WHERE deletedAt IS NULL — declared in a raw migration
+  // because Prisma can't express lower()/WHERE. See migration `init`.
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin)
+}
+
+enum ShareMode {
+  PUBLIC // anyone with the link
+  RESTRICTED // only granted users
+}
+
+/// Access level, ranked NONE < VIEWER < EDITOR < OWNER. Only VIEWER/EDITOR are
+/// ever stored (NONE = no grant, OWNER = room ownership); the ladder lets checks
+/// compare ranks instead of juggling booleans, so editors slot in without a
+/// migration — the UI just starts offering EDITOR.
+enum ShareRole {
+  VIEWER
+  EDITOR
+}
+
+/// A share grants access to one Node — and, by inheritance, everything beneath
+/// it. publicToken backs "anyone with the link"; RESTRICTED shares add per-user
+/// grants. Because the node is unified, one share covers a room, folder or file.
+model Share {
+  id          String    @id @default(uuid())
+  nodeId      String
+  mode        ShareMode
+  role        ShareRole @default(VIEWER)
+  publicToken String?   @unique
+  ownerId     String
+  createdAt   DateTime  @default(now())
+  revokedAt   DateTime?
+
+  node   Node         @relation(fields: [nodeId], references: [id], onDelete: Cascade)
+  owner  User         @relation("SharesCreated", fields: [ownerId], references: [id], onDelete: Cascade)
+  grants ShareGrant[]
+
+  @@index([nodeId])
+  @@index([ownerId])
+}
+
+/// Per-user grant on a RESTRICTED share, carrying its own role on the ladder.
+model ShareGrant {
+  id      String    @id @default(uuid())
+  shareId String
+  userId  String
+  role    ShareRole @default(VIEWER)
+
+  share Share @relation(fields: [shareId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([shareId, userId])
+  @@index([userId])
+}
